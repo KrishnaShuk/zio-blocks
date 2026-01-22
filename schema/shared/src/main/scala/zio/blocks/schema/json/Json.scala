@@ -64,6 +64,46 @@ sealed trait Json { self =>
   def isNull: Boolean = false
 
   // ===========================================================================
+  // Type Filtering (returns JsonSelection)
+  // ===========================================================================
+
+  /**
+   * Returns a [[JsonSelection]] containing this value if it is an object,
+   * otherwise an empty selection.
+   */
+  def asObject: JsonSelection = if (isObject) JsonSelection(self) else JsonSelection.empty
+
+  /**
+   * Returns a [[JsonSelection]] containing this value if it is an array,
+   * otherwise an empty selection.
+   */
+  def asArray: JsonSelection = if (isArray) JsonSelection(self) else JsonSelection.empty
+
+  /**
+   * Returns a [[JsonSelection]] containing this value if it is a string,
+   * otherwise an empty selection.
+   */
+  def asString: JsonSelection = if (isString) JsonSelection(self) else JsonSelection.empty
+
+  /**
+   * Returns a [[JsonSelection]] containing this value if it is a number,
+   * otherwise an empty selection.
+   */
+  def asNumber: JsonSelection = if (isNumber) JsonSelection(self) else JsonSelection.empty
+
+  /**
+   * Returns a [[JsonSelection]] containing this value if it is a boolean,
+   * otherwise an empty selection.
+   */
+  def asBoolean: JsonSelection = if (isBoolean) JsonSelection(self) else JsonSelection.empty
+
+  /**
+   * Returns a [[JsonSelection]] containing this value if it is null,
+   * otherwise an empty selection.
+   */
+  def asNull: JsonSelection = if (isNull) JsonSelection(self) else JsonSelection.empty
+
+  // ===========================================================================
   // Direct Accessors
   // ===========================================================================
 
@@ -187,10 +227,548 @@ sealed trait Json { self =>
     case _ => self
   }
 
+  // ===========================================================================
+  // Merging
+  // ===========================================================================
+
+  /**
+   * Merges this JSON with another using the specified strategy.
+   *
+   * {{{
+   * val merged = json1.merge(json2, MergeStrategy.Deep)
+   * }}}
+   *
+   * @param other
+   *   The JSON to merge with
+   * @param strategy
+   *   The merge strategy (default: [[MergeStrategy.Auto]])
+   * @return
+   *   The merged JSON
+   */
+  def merge(other: Json, strategy: MergeStrategy = MergeStrategy.Auto): Json =
+    mergeInternal(other, strategy, DynamicOptic.root)
+
+  private def mergeInternal(other: Json, strategy: MergeStrategy, path: DynamicOptic): Json =
+    strategy match {
+      case MergeStrategy.Replace => other
+      case MergeStrategy.Shallow => (self, other) match {
+        case (Json.Object(flds1), Json.Object(flds2)) =>
+          val map1  = flds1.toMap
+          val map2  = flds2.toMap
+          val merged = (map1 ++ map2).toVector
+          Json.Object(merged)
+        case _ => other
+      }
+      case MergeStrategy.Concat => (self, other) match {
+        case (Json.Array(e1), Json.Array(e2)) => Json.Array(e1 ++ e2)
+        case _                                => other
+      }
+      case MergeStrategy.Deep => (self, other) match {
+        case (Json.Object(flds1), Json.Object(flds2)) =>
+          val map1 = flds1.toMap
+          val map2 = flds2.toMap
+          val allKeys = (map1.keys ++ map2.keys).toVector.distinct
+          val merged = allKeys.map { k =>
+            (map1.get(k), map2.get(k)) match {
+              case (Some(v1), Some(v2)) => (k, v1.mergeInternal(v2, strategy, path.field(k)))
+              case (Some(v1), None)     => (k, v1)
+              case (None, Some(v2))     => (k, v2)
+              case (None, None)         => (k, Json.Null) // should not happen
+            }
+          }
+          Json.Object(merged)
+        case (Json.Array(e1), Json.Array(e2)) => Json.Array(e1 ++ e2)
+        case _ => other
+      }
+      case MergeStrategy.Auto => (self, other) match {
+        case (Json.Object(flds1), Json.Object(flds2)) =>
+          val map1 = flds1.toMap
+          val map2 = flds2.toMap
+          val allKeys = (map1.keys ++ map2.keys).toVector.distinct
+          val merged = allKeys.map { k =>
+            (map1.get(k), map2.get(k)) match {
+              case (Some(v1), Some(v2)) => (k, v1.mergeInternal(v2, MergeStrategy.Auto, path.field(k)))
+              case (Some(v1), None)     => (k, v1)
+              case (None, Some(v2))     => (k, v2)
+              case (None, None)         => (k, Json.Null)
+            }
+          }
+          Json.Object(merged)
+        case (Json.Array(e1), Json.Array(e2)) => Json.Array(e1 ++ e2)
+        case _ => other
+      }
+      case MergeStrategy.Custom(f) => f(path, self, other)
+    }
+
+  // ===========================================================================
+  // Transformation
+  // ===========================================================================
+
+  /**
+   * Transforms all values in this JSON bottom-up (children before parents).
+   *
+   * @param f The transformation function receiving path and value
+   * @return The transformed JSON
+   */
+  def transformUp(f: (DynamicOptic, Json) => Json): Json =
+    transformUpInternal(f, DynamicOptic.root)
+
+  private def transformUpInternal(f: (DynamicOptic, Json) => Json, path: DynamicOptic): Json = {
+    val transformed = self match {
+      case Json.Object(flds) =>
+        Json.Object(flds.map { case (k, v) =>
+          (k, v.transformUpInternal(f, path.field(k)))
+        })
+      case Json.Array(elems) =>
+        Json.Array(elems.zipWithIndex.map { case (v, i) =>
+          v.transformUpInternal(f, path.at(i))
+        })
+      case other => other
+    }
+    f(path, transformed)
+  }
+
+  /**
+   * Transforms all values in this JSON top-down (parents before children).
+   *
+   * @param f The transformation function receiving path and value
+   * @return The transformed JSON
+   */
+  def transformDown(f: (DynamicOptic, Json) => Json): Json =
+    transformDownInternal(f, DynamicOptic.root)
+
+  private def transformDownInternal(f: (DynamicOptic, Json) => Json, path: DynamicOptic): Json = {
+    val transformed = f(path, self)
+    transformed match {
+      case Json.Object(flds) =>
+        Json.Object(flds.map { case (k, v) =>
+          (k, v.transformDownInternal(f, path.field(k)))
+        })
+      case Json.Array(elems) =>
+        Json.Array(elems.zipWithIndex.map { case (v, i) =>
+          v.transformDownInternal(f, path.at(i))
+        })
+      case other => other
+    }
+  }
+
+  /**
+   * Transforms all object keys in this JSON.
+   *
+   * @param f The key transformation function receiving path and key
+   * @return The transformed JSON
+   */
+  def transformKeys(f: (DynamicOptic, String) => String): Json =
+    transformKeysInternal(f, DynamicOptic.root)
+
+  private def transformKeysInternal(f: (DynamicOptic, String) => String, path: DynamicOptic): Json =
+    self match {
+      case Json.Object(flds) =>
+        Json.Object(flds.map { case (k, v) =>
+          val newKey = f(path, k)
+          (newKey, v.transformKeysInternal(f, path.field(k)))
+        })
+      case Json.Array(elems) =>
+        Json.Array(elems.zipWithIndex.map { case (v, i) =>
+          v.transformKeysInternal(f, path.at(i))
+        })
+      case other => other
+    }
+
+  // ===========================================================================
+  // Filtering
+  // ===========================================================================
+
+  /**
+   * Removes entries matching the predicate.
+   *
+   * For objects, removes matching key-value pairs.
+   * For arrays, removes matching elements.
+   *
+   * @param p The predicate receiving path and value
+   * @return The filtered JSON
+   */
+  def filterNot(p: (DynamicOptic, Json) => scala.Boolean): Json =
+    filterNotInternal(p, DynamicOptic.root)
+
+  private def filterNotInternal(p: (DynamicOptic, Json) => scala.Boolean, path: DynamicOptic): Json =
+    self match {
+      case Json.Object(flds) =>
+        Json.Object(flds.flatMap { case (k, v) =>
+          val childPath = path.field(k)
+          if (p(childPath, v)) None
+          else Some((k, v.filterNotInternal(p, childPath)))
+        })
+      case Json.Array(elems) =>
+        Json.Array(elems.zipWithIndex.flatMap { case (v, i) =>
+          val childPath = path.at(i)
+          if (p(childPath, v)) None
+          else Some(v.filterNotInternal(p, childPath))
+        })
+      case other => other
+    }
+
+  /**
+   * Keeps only entries matching the predicate.
+   *
+   * @param p The predicate receiving path and value
+   * @return The filtered JSON
+   */
+  def filter(p: (DynamicOptic, Json) => scala.Boolean): Json =
+    filterNot((path, json) => !p(path, json))
+
+  // ===========================================================================
+  // Folding
+  // ===========================================================================
+
+  /**
+   * Folds over this JSON top-down (parents before children).
+   *
+   * @param z The initial accumulator value
+   * @param f The fold function receiving path, value, and accumulator
+   * @tparam B The accumulator type
+   * @return The final accumulated value
+   */
+  def foldDown[B](z: B)(f: (DynamicOptic, Json, B) => B): B =
+    foldDownInternal(z, f, DynamicOptic.root)
+
+  private def foldDownInternal[B](z: B, f: (DynamicOptic, Json, B) => B, path: DynamicOptic): B = {
+    val acc = f(path, self, z)
+    self match {
+      case Json.Object(flds) =>
+        flds.foldLeft(acc) { case (a, (k, v)) =>
+          v.foldDownInternal(a, f, path.field(k))
+        }
+      case Json.Array(elems) =>
+        elems.zipWithIndex.foldLeft(acc) { case (a, (v, i)) =>
+          v.foldDownInternal(a, f, path.at(i))
+        }
+      case _ => acc
+    }
+  }
+
+  /**
+   * Folds over this JSON bottom-up (children before parents).
+   *
+   * @param z The initial accumulator value
+   * @param f The fold function receiving path, value, and accumulator
+   * @tparam B The accumulator type
+   * @return The final accumulated value
+   */
+  def foldUp[B](z: B)(f: (DynamicOptic, Json, B) => B): B =
+    foldUpInternal(z, f, DynamicOptic.root)
+
+  private def foldUpInternal[B](z: B, f: (DynamicOptic, Json, B) => B, path: DynamicOptic): B = {
+    val childAcc = self match {
+      case Json.Object(flds) =>
+        flds.foldLeft(z) { case (a, (k, v)) =>
+          v.foldUpInternal(a, f, path.field(k))
+        }
+      case Json.Array(elems) =>
+        elems.zipWithIndex.foldLeft(z) { case (a, (v, i)) =>
+          v.foldUpInternal(a, f, path.at(i))
+        }
+      case _ => z
+    }
+    f(path, self, childAcc)
+  }
+
+  /**
+   * Folds over this JSON top-down, allowing the fold function to fail.
+   *
+   * Short-circuits on first failure.
+   */
+  def foldDownOrFail[B](z: B)(f: (DynamicOptic, Json, B) => Either[JsonError, B]): Either[JsonError, B] =
+    foldDownOrFailInternal(z, f, DynamicOptic.root)
+
+  private def foldDownOrFailInternal[B](
+    z: B,
+    f: (DynamicOptic, Json, B) => Either[JsonError, B],
+    path: DynamicOptic
+  ): Either[JsonError, B] =
+    f(path, self, z).flatMap { acc =>
+      self match {
+        case Json.Object(flds) =>
+          flds.foldLeft[Either[JsonError, B]](Right(acc)) { case (eAcc, (k, v)) =>
+            eAcc.flatMap(a => v.foldDownOrFailInternal(a, f, path.field(k)))
+          }
+        case Json.Array(elems) =>
+          elems.zipWithIndex.foldLeft[Either[JsonError, B]](Right(acc)) { case (eAcc, (v, i)) =>
+            eAcc.flatMap(a => v.foldDownOrFailInternal(a, f, path.at(i)))
+          }
+        case _ => Right(acc)
+      }
+    }
+
+  /**
+   * Folds over this JSON bottom-up, allowing the fold function to fail.
+   *
+   * Short-circuits on first failure.
+   */
+  def foldUpOrFail[B](z: B)(f: (DynamicOptic, Json, B) => Either[JsonError, B]): Either[JsonError, B] =
+    foldUpOrFailInternal(z, f, DynamicOptic.root)
+
+  private def foldUpOrFailInternal[B](
+    z: B,
+    f: (DynamicOptic, Json, B) => Either[JsonError, B],
+    path: DynamicOptic
+  ): Either[JsonError, B] = {
+    val childResult: Either[JsonError, B] = self match {
+      case Json.Object(flds) =>
+        flds.foldLeft[Either[JsonError, B]](Right(z)) { case (eAcc, (k, v)) =>
+          eAcc.flatMap(a => v.foldUpOrFailInternal(a, f, path.field(k)))
+        }
+      case Json.Array(elems) =>
+        elems.zipWithIndex.foldLeft[Either[JsonError, B]](Right(z)) { case (eAcc, (v, i)) =>
+          eAcc.flatMap(a => v.foldUpOrFailInternal(a, f, path.at(i)))
+        }
+      case _ => Right(z)
+    }
+    childResult.flatMap(acc => f(path, self, acc))
+  }
+
+  // ===========================================================================
+  // Querying
+  // ===========================================================================
+
+  /**
+   * Selects all values matching the predicate.
+   *
+   * @param p The predicate receiving path and value
+   * @return A [[JsonSelection]] containing matching values
+   */
+  def query(p: (DynamicOptic, Json) => scala.Boolean): JsonSelection =
+    queryInternal(p, DynamicOptic.root)
+
+  private def queryInternal(p: (DynamicOptic, Json) => scala.Boolean, path: DynamicOptic): JsonSelection = {
+    val selfMatches  = if (p(path, self)) Vector(self) else Vector.empty
+    val childMatches = self match {
+      case Json.Object(flds) =>
+        flds.flatMap { case (k, v) =>
+          v.queryInternal(p, path.field(k)).toEither.getOrElse(Vector.empty)
+        }
+      case Json.Array(elems) =>
+        elems.zipWithIndex.flatMap { case (v, i) =>
+          v.queryInternal(p, path.at(i)).toEither.getOrElse(Vector.empty)
+        }
+      case _ => Vector.empty
+    }
+    JsonSelection.fromVector(selfMatches ++ childMatches)
+  }
+
+  // ===========================================================================
+  // Projection / Partitioning
+  // ===========================================================================
+
+  /**
+   * Projects this JSON to include only the specified paths.
+   *
+   * Paths that don't exist are ignored. Structure is preserved.
+   *
+   * @param paths The paths to include
+   * @return A new JSON containing only the specified paths
+   */
+  def project(paths: DynamicOptic*): Json = {
+    if (paths.isEmpty) Json.Null
+    else {
+      paths.foldLeft[Option[Json]](None) { (acc, path) =>
+        val extracted = get(path).first.toOption
+        extracted match {
+          case Some(value) =>
+            val built = buildPath(path, value)
+            acc match {
+              case Some(existing) => Some(existing.merge(built, MergeStrategy.Deep))
+              case None           => Some(built)
+            }
+          case None => acc
+        }
+      }.getOrElse(Json.Null)
+    }
+  }
+
+  private def buildPath(path: DynamicOptic, value: Json): Json = {
+    path.nodes.foldRight(value) { (node, acc) =>
+      node match {
+        case Node.Field(name)   => Json.Object(Vector((name, acc)))
+        case Node.AtIndex(idx)  =>
+          val arr = Vector.fill(idx)(Json.Null) :+ acc
+          Json.Array(arr)
+        case _ => acc
+      }
+    }
+  }
+
+  /**
+   * Partitions this JSON into two based on a predicate.
+   *
+   * Returns a tuple where the first element contains entries satisfying
+   * the predicate, and the second contains entries that don't.
+   *
+   * @param p The predicate receiving path and value
+   * @return A tuple of (matching, non-matching) JSON values
+   */
+  def partition(p: (DynamicOptic, Json) => scala.Boolean): (Json, Json) =
+    (filter(p), filterNot(p))
+
+  // ===========================================================================
+  // KV Representation
+  // ===========================================================================
+
+  /**
+   * Flattens this JSON to a sequence of path-value pairs.
+   *
+   * Only leaf values (primitives, empty arrays, empty objects) are included.
+   */
+  def toKV: Seq[(DynamicOptic, Json)] = toKVInternal(DynamicOptic.root)
+
+  private def toKVInternal(path: DynamicOptic): Seq[(DynamicOptic, Json)] = self match {
+    case Json.Object(flds) if flds.nonEmpty =>
+      flds.flatMap { case (k, v) => v.toKVInternal(path.field(k)) }
+    case Json.Array(elems) if elems.nonEmpty =>
+      elems.zipWithIndex.flatMap { case (v, i) => v.toKVInternal(path.at(i)) }
+    case _ => Seq((path, self))
+  }
+
+  // ===========================================================================
+  // Error-Returning Variants
+  // ===========================================================================
+
+  /**
+   * Modifies values at the given path using a partial function.
+   * Returns an error if the path is invalid or the partial function is not defined.
+   */
+  def modifyOrFail(path: DynamicOptic, pf: PartialFunction[Json, Json]): Either[JsonError, Json] =
+    get(path).first match {
+      case Right(target) if pf.isDefinedAt(target) =>
+        Right(modify(path, pf))
+      case Right(_) =>
+        Left(JsonError(s"Partial function not defined for value at path $path", path))
+      case Left(err) =>
+        Left(JsonError.fromSchemaError(err))
+    }
+
+  /**
+   * Sets the value at the given path, returning an error if the path is invalid.
+   */
+  def setOrFail(path: DynamicOptic, value: Json): Either[JsonError, Json] =
+    if (path.nodes.isEmpty) Right(value)
+    else {
+      val parentPath = new DynamicOptic(path.nodes.init)
+      get(parentPath).first match {
+        case Right(_) => Right(set(path, value))
+        case Left(err) => Left(JsonError.fromSchemaError(err))
+      }
+    }
+
+  /**
+   * Deletes values at the given path, returning an error if the path is invalid.
+   */
+  def deleteOrFail(path: DynamicOptic): Either[JsonError, Json] =
+    if (path.nodes.isEmpty) Left(JsonError("Cannot delete root"))
+    else {
+      get(path).first match {
+        case Right(_)  => Right(delete(path))
+        case Left(err) => Left(JsonError.fromSchemaError(err))
+      }
+    }
+
+  /**
+   * Inserts a value at the given path.
+   *
+   * For arrays, inserts at the specified index, shifting subsequent elements.
+   * For objects, adds or replaces the key.
+   */
+  def insert(path: DynamicOptic, value: Json): Json =
+    if (path.nodes.isEmpty) value
+    else {
+      val parentPath = new DynamicOptic(path.nodes.init)
+      val targetNode = path.nodes.last
+      modify(parentPath, parent => (parent, targetNode) match {
+        case (Json.Array(elems), Node.AtIndex(idx)) =>
+          val insertIdx = math.min(math.max(0, idx), elems.length)
+          Json.Array(elems.patch(insertIdx, Vector(value), 0))
+        case (Json.Object(flds), Node.Field(name)) =>
+          val filtered = flds.filterNot(_._1 == name)
+          Json.Object(filtered :+ (name, value))
+        case _ => parent
+      })
+    }
+
+  /**
+   * Inserts a value at the given path, returning an error if invalid.
+   */
+  def insertOrFail(path: DynamicOptic, value: Json): Either[JsonError, Json] =
+    if (path.nodes.isEmpty) Right(value)
+    else {
+      val parentPath = new DynamicOptic(path.nodes.init)
+      get(parentPath).first match {
+        case Right(_)  => Right(insert(path, value))
+        case Left(err) => Left(JsonError.fromSchemaError(err))
+      }
+    }
+
   /**
    * Decodes this JSON value to a value of type `A`.
    */
   def as[A](implicit decoder: JsonDecoder[A]): Either[JsonError, A] = decoder.decode(self)
+
+  /**
+   * Decodes this JSON value to a value of type `A`, throwing on failure.
+   */
+  def asUnsafe[A](implicit decoder: JsonDecoder[A]): A = as[A].fold(throw _, identity)
+
+  // ===========================================================================
+  // Normalization
+  // ===========================================================================
+
+  /**
+   * Returns this JSON with all object keys sorted alphabetically (recursive).
+   */
+  def sortKeys: Json = self match {
+    case Json.Object(flds) =>
+      Json.Object(flds.map { case (k, v) => (k, v.sortKeys) }.sortBy(_._1))
+    case Json.Array(elems) =>
+      Json.Array(elems.map(_.sortKeys))
+    case other =>
+      other
+  }
+
+  /**
+   * Returns this JSON with all null values removed from objects.
+   */
+  def dropNulls: Json = self match {
+    case Json.Object(flds) =>
+      Json.Object(flds.collect { case (k, v) if !v.isNull => (k, v.dropNulls) })
+    case Json.Array(elems) =>
+      Json.Array(elems.map(_.dropNulls))
+    case other =>
+      other
+  }
+
+  /**
+   * Returns this JSON with empty objects and arrays removed.
+   */
+  def dropEmpty: Json = self match {
+    case Json.Object(flds) =>
+      val filtered = flds.flatMap { case (k, v) =>
+        val dropped = v.dropEmpty
+        dropped match {
+          case Json.Object(f) if f.isEmpty => None
+          case Json.Array(e) if e.isEmpty  => None
+          case other                       => Some((k, other))
+        }
+      }
+      Json.Object(filtered)
+    case Json.Array(elems) =>
+      val filtered = elems.map(_.dropEmpty).filter {
+        case Json.Object(f) if f.isEmpty => false
+        case Json.Array(e) if e.isEmpty  => false
+        case _                           => true
+      }
+      Json.Array(filtered)
+    case other =>
+      other
+  }
 
   // ===========================================================================
   // DynamicValue Conversion
@@ -219,6 +797,46 @@ sealed trait Json { self =>
     case Json.Object(fields) =>
       DynamicValue.Record(fields.map { case (k, v) => (k, v.toDynamicValue) })
   }
+
+  // ===========================================================================
+  // Encoding (Instance Methods)
+  // ===========================================================================
+
+  /**
+   * Encodes this JSON to a compact string (no extra whitespace).
+   */
+  def print: String = Json.encode(self)
+
+  /**
+   * Encodes this JSON to a string using the specified configuration.
+   *
+   * @param config Writer configuration (indentation, unicode escaping, etc.)
+   */
+  def print(config: WriterConfig): String = Json.encode(self, config)
+
+  /**
+   * Alias for [[print]].
+   */
+  def encode: String = print
+
+  /**
+   * Encodes this JSON to a string using the specified configuration.
+   *
+   * @param config Writer configuration
+   */
+  def encode(config: WriterConfig): String = print(config)
+
+  /**
+   * Encodes this JSON to a byte array (UTF-8).
+   */
+  def encodeToBytes: Array[Byte] = Json.encodeToBytes(self)
+
+  /**
+   * Encodes this JSON to a byte array (UTF-8) with configuration.
+   *
+   * @param config Writer configuration
+   */
+  def encodeToBytes(config: WriterConfig): Array[Byte] = Json.encodeToBytes(self, config)
 
   // ===========================================================================
   // Standard Methods
@@ -647,9 +1265,118 @@ object Json {
     codec.decode(s).left.map(e => JsonError(e.getMessage))
 
   /**
+   * Parses a byte array (UTF-8) into a JSON value.
+   */
+  def parse(bytes: scala.Array[Byte]): Either[JsonError, Json] =
+    codec.decode(bytes).left.map(e => JsonError(e.getMessage))
+
+  /**
+   * Parses a string into a JSON value, throwing on failure.
+   */
+  def parseUnsafe(s: java.lang.String): Json =
+    parse(s).fold(throw _, identity)
+
+  /**
+   * Alias for [[parseUnsafe]].
+   */
+  def decodeUnsafe(s: java.lang.String): Json = parseUnsafe(s)
+
+  /**
    * Encodes a JSON value into a string.
    */
   def encode(json: Json): java.lang.String = codec.encodeToString(json)
+
+  /**
+   * Encodes a JSON value into a string with configuration.
+   */
+  def encode(json: Json, config: WriterConfig): java.lang.String = codec.encodeToString(json, config)
+
+  /**
+   * Encodes a JSON value into a byte array (UTF-8).
+   */
+  def encodeToBytes(json: Json): scala.Array[Byte] = codec.encode(json)
+
+  /**
+   * Encodes a JSON value into a byte array (UTF-8) with configuration.
+   */
+  def encodeToBytes(json: Json, config: WriterConfig): scala.Array[Byte] = codec.encode(json, config)
+
+  // ===========================================================================
+  // KV Interop
+  // ===========================================================================
+
+  /**
+   * Assembles JSON from a sequence of path-value pairs.
+   *
+   * @param kvs The path-value pairs
+   * @return Either an error (for conflicting paths) or the assembled JSON
+   */
+  def fromKV(kvs: Seq[(DynamicOptic, Json)]): Either[JsonError, Json] = {
+    if (kvs.isEmpty) Right(Json.Null)
+    else {
+      try {
+        val result = kvs.foldLeft[Json](Json.Null) { case (acc, (path, value)) =>
+          if (path.nodes.isEmpty) value
+          else {
+            val built = buildFromKV(path, value)
+            if (acc == Json.Null) built
+            else acc.merge(built, overlayStrategy)
+          }
+        }
+        Right(result)
+      } catch {
+        case e: Exception => Left(JsonError(s"Failed to assemble JSON from KV: ${e.getMessage}"))
+      }
+    }
+  }
+
+  private val overlayStrategy: MergeStrategy = MergeStrategy.Custom { (_, v1, v2) =>
+    (v1, v2) match {
+      case (Json.Object(flds1), Json.Object(flds2)) =>
+        val map1 = flds1.toMap
+        val map2 = flds2.toMap
+        val allKeys = (map1.keys ++ map2.keys).toVector.distinct
+        val merged = allKeys.map { k =>
+          (map1.get(k), map2.get(k)) match {
+            case (Some(c1), Some(c2)) => (k, c1.merge(c2, overlayStrategy))
+            case (Some(c1), None)     => (k, c1)
+            case (None, Some(c2))     => (k, c2)
+            case (None, None)         => (k, Json.Null)
+          }
+        }
+        Json.Object(merged)
+      case (Json.Array(e1), Json.Array(e2)) =>
+        val maxLen = math.max(e1.length, e2.length)
+        val merged = (0 until maxLen).map { i =>
+          val c1 = if (i < e1.length) e1(i) else Json.Null
+          val c2 = if (i < e2.length) e2(i) else Json.Null
+          (c1, c2) match {
+            case (Json.Null, _) => c2
+            case (_, Json.Null) => c1
+            case _              => c1.merge(c2, overlayStrategy)
+          }
+        }.toVector
+        Json.Array(merged)
+      case _ => v2
+    }
+  }
+
+  private def buildFromKV(path: DynamicOptic, value: Json): Json =
+    path.nodes.foldRight(value) { (node, acc) =>
+      node match {
+        case DynamicOptic.Node.Field(name)   => Json.Object(Vector((name, acc)))
+        case DynamicOptic.Node.AtIndex(idx)  =>
+          val arr = Vector.fill(idx)(Json.Null) :+ acc
+          Json.Array(arr)
+        case _ => acc
+      }
+    }
+
+  /**
+   * Assembles JSON from path-value pairs, throwing on conflict.
+   */
+  def fromKVUnsafe(kvs: Seq[(DynamicOptic, Json)]): Json =
+    fromKV(kvs).fold(throw _, identity)
 
   // ===========================================================================
   // Ordering

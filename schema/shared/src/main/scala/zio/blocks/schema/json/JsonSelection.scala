@@ -80,6 +80,11 @@ final case class JsonSelection(toEither: Either[SchemaError, Vector[Json]]) { se
    */
   def get(path: DynamicOptic): JsonSelection = flatMap(_.get(path))
 
+  /**
+   * Alias for [[get]].
+   */
+  def apply(path: DynamicOptic): JsonSelection = get(path)
+
   // ===========================================================================
   // Type Filters
   // ===========================================================================
@@ -158,9 +163,9 @@ final case class JsonSelection(toEither: Either[SchemaError, Vector[Json]]) { se
     }
 
   /**
-   * Returns all selected values as a Vector.
+   * Returns all selected values as a JSON array.
    */
-  def toArray: Either[SchemaError, Vector[Json]] = toEither
+  def toArray: Either[SchemaError, Json] = toEither.map(jsons => Json.Array(jsons))
 }
 
 object JsonSelection {
